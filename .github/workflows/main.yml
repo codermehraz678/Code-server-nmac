@@ -1,0 +1,236 @@
+name: "☁️ macOS Remote Dev Environment"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session-timeout:
+        description: "Session duration (minutes, max 360)"
+        required: false
+        default: "360"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "240"
+          - "360"
+      code-server-port:
+        description: "code-server port"
+        required: false
+        default: "8080"
+        type: string
+
+# ─────────────────────────────────────────────────────────
+# Required GitHub Secrets:
+#   TS_AUTHKEY            – Tailscale auth key (reusable, ephemeral recommended)
+#   CODE_SERVER_PASSWORD  – Password to protect code-server
+#   ANTHROPIC_API_KEY     – API key for Claude CLI
+# ─────────────────────────────────────────────────────────
+
+jobs:
+  remote-dev:
+    name: "🖥️ Spawn Dev Machine"
+    runs-on: macos-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.session-timeout || '360') }}
+
+    env:
+      WORKSPACE: /Users/runner/workspace
+      PORT: ${{ github.event.inputs.code-server-port || '8080' }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Workspace & Downloads ─────────────────────────
+      - name: 📁 Prepare workspace and Downloads folder
+        run: |
+          mkdir -p "$WORKSPACE"
+          mkdir -p ~/Downloads
+
+          # Symlink Downloads into the workspace so code-server can browse it
+          ln -sfn ~/Downloads "$WORKSPACE/Downloads"
+
+          # Copy the checked-out repo into workspace (including dotfiles, safely)
+          rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/" 2>/dev/null || true
+
+          echo "✅ Workspace ready at $WORKSPACE"
+          ls -la "$WORKSPACE"
+
+      # ── 3. Node.js ───────────────────────────────────────
+      - name: ⬢ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── 4. Tailscale ─────────────────────────────────────
+      - name: 🔗 Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          # ── OR use OAuth (comment authkey above, uncomment below) ──
+          # oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          # oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          # tags:            tag:ci
+          hostname: gh-macos-dev
+
+      # ── 5. Install code-server ───────────────────────────
+      - name: 🖥️ Install code-server
+        run: |
+          echo "Installing code-server via official install script..."
+          curl -fsSL https://code-server.dev/install.sh | sh
+          code-server --version
+
+      # ── 6. Install Claude CLI ────────────────────────────
+      - name: 🤖 Install Claude CLI (claude-code)
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          echo "Claude CLI version:"
+          claude --version || echo "Installed (version check may require auth)"
+
+      # ── 7. Persist env vars for interactive shells ───────
+      - name: 🔐 Configure environment for interactive sessions
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Resolve the global npm bin directory (npm bin -g was removed in npm 9+)
+          NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
+
+          # Make API key and PATH available inside code-server terminals
+          PROFILE=~/.zshrc
+          touch "$PROFILE"
+
+          {
+            echo ""
+            echo "# ── GitHub Actions Dev Environment ──"
+            printf 'export ANTHROPIC_API_KEY="%s"\n' "$ANTHROPIC_API_KEY"
+            echo "export PATH=\"${NPM_GLOBAL_BIN}:\$PATH\""
+            echo "export WORKSPACE=\"${WORKSPACE}\""
+            echo "alias downloads='cd ~/Downloads && ls -la'"
+            echo "alias ws='cd ${WORKSPACE} && ls -la'"
+          } >> "$PROFILE"
+
+          # Also write a bashrc for bash users
+          cp "$PROFILE" ~/.bashrc
+
+          echo "✅ Shell environment configured"
+
+      # ── 8. Configure & start code-server ─────────────────
+      - name: 🚀 Start code-server
+        env:
+          PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
+        run: |
+          mkdir -p ~/.config/code-server
+
+          cat > ~/.config/code-server/config.yaml << 'OUTER'
+          bind-addr: 0.0.0.0:${PORT}
+          auth: password
+          cert: false
+          disable-telemetry: true
+          OUTER
+
+          # Inject the actual password (avoids YAML-escaping issues)
+          sed -i '' "s|^bind-addr:.*|bind-addr: 0.0.0.0:${PORT}|" ~/.config/code-server/config.yaml
+
+          # Start code-server in the background opening the workspace
+          PASSWORD="$PASSWORD" nohup code-server \
+            --bind-addr "0.0.0.0:${PORT}" \
+            --auth password \
+            --disable-telemetry \
+            "$WORKSPACE" \
+            > /tmp/code-server.log 2>&1 &
+
+          CODE_PID=$!
+          sleep 4
+
+          # Verify it started
+          if kill -0 "$CODE_PID" 2>/dev/null; then
+            echo "✅ code-server running (PID $CODE_PID)"
+          else
+            echo "❌ code-server failed to start"
+            cat /tmp/code-server.log
+            exit 1
+          fi
+
+      # ── 9. Install useful VS Code extensions ─────────────
+      - name: 🧩 Install VS Code extensions
+        run: |
+          code-server --install-extension ms-python.python          || true
+          code-server --install-extension esbenp.prettier-vscode    || true
+          code-server --install-extension dbaeumer.vscode-eslint    || true
+          code-server --install-extension eamodio.gitlens           || true
+          echo "✅ Extensions installed"
+
+      # ── 10. Print connection info ─────────────────────────
+      - name: 📋 Display connection details
+        run: |
+          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
+          TAILSCALE_DNS=$(tailscale status --self --json 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" \
+            2>/dev/null || echo "unknown")
+
+          DIVIDER="════════════════════════════════════════════════════"
+
+          echo ""
+          echo "$DIVIDER"
+          echo "  🖥️  REMOTE DEV ENVIRONMENT IS READY"
+          echo "$DIVIDER"
+          echo ""
+          echo "  code-server (IP) :  http://${TAILSCALE_IP}:${PORT}"
+          echo "  code-server (DNS):  http://${TAILSCALE_DNS}:${PORT}"
+          echo ""
+          echo "  Tailscale IP     :  ${TAILSCALE_IP}"
+          echo "  Tailscale DNS    :  ${TAILSCALE_DNS}"
+          echo ""
+          echo "  Workspace        :  ${WORKSPACE}"
+          echo "  Downloads        :  ${WORKSPACE}/Downloads  (→ ~/Downloads)"
+          echo ""
+          echo "  Claude CLI       :  type 'claude' in any terminal"
+          echo ""
+          echo "  Timeout          :  ${{ github.event.inputs.session-timeout || '360' }} min"
+          echo ""
+          echo "  🛑 To stop early :  touch ~/stop"
+          echo "       or cancel the workflow from GitHub Actions UI"
+          echo ""
+          echo "$DIVIDER"
+
+          # Also surface as GitHub Actions annotations
+          echo "::notice title=🖥️ code-server URL::http://${TAILSCALE_IP}:${PORT}"
+          echo "::notice title=🔗 Tailscale DNS::http://${TAILSCALE_DNS}:${PORT}"
+
+      # ── 11. Keep alive loop ──────────────────────────────
+      - name: ⏳ Keep session alive
+        run: |
+          echo "Session active — polling every 30s for ~/stop sentinel file..."
+          echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
+
+          SECONDS_ALIVE=0
+          while true; do
+            # Check for manual stop signal
+            if [ -f ~/stop ]; then
+              echo "🛑 Stop file detected (~/stop). Shutting down gracefully."
+              break
+            fi
+
+            # Health-check code-server
+            if ! pgrep -f code-server > /dev/null 2>&1; then
+              echo "⚠️  code-server process died — restarting..."
+              PASSWORD="${PASSWORD}" nohup code-server \
+                --bind-addr "0.0.0.0:${PORT}" \
+                --auth password \
+                --disable-telemetry \
+                "$WORKSPACE" \
+                > /tmp/code-server.log 2>&1 &
+              sleep 3
+            fi
+
+            sleep 30
+            SECONDS_ALIVE=$((SECONDS_ALIVE + 30))
+
+            # Print heartbeat every 5 minutes
+            if [ $((SECONDS_ALIVE % 300)) -eq 0 ]; then
+              MINS=$((SECONDS_ALIVE / 60))
+              echo "💓 Heartbeat — alive for ${MINS} minutes"
+            fi
+          done
+
+          echo "👋 Session ended after $((SECONDS_ALIVE / 60)) minutes."
