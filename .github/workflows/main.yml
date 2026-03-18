@@ -35,6 +35,7 @@ jobs:
     env:
       WORKSPACE: /Users/runner/workspace
       PORT: ${{ github.event.inputs.code-server-port || '8080' }}
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────
@@ -47,10 +48,8 @@ jobs:
           mkdir -p "$WORKSPACE"
           mkdir -p ~/Downloads
 
-          # Symlink Downloads into the workspace so code-server can browse it
           ln -sfn ~/Downloads "$WORKSPACE/Downloads"
 
-          # Copy the checked-out repo into workspace
           rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/" 2>/dev/null || true
 
           echo "✅ Workspace ready at $WORKSPACE"
@@ -69,38 +68,57 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "📦 Installing Tailscale via Homebrew..."
-          brew install tailscale
+          echo "📦 Installing Tailscale..."
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install tailscale
 
-          echo "🚀 Starting tailscaled daemon..."
-          sudo tailscaled --state=/tmp/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --tun=utun &
-          
-          # Wait for the daemon socket to appear
-          echo "⏳ Waiting for tailscaled to be ready..."
+          sudo mkdir -p /var/run/tailscale
+
+          echo "🚀 Starting tailscaled (userspace networking)..."
+          sudo tailscaled \
+            --state=/tmp/tailscaled.state \
+            --socket="$TS_SOCKET" \
+            --tun=userspace-networking \
+            --port=41641 \
+            > /tmp/tailscaled.log 2>&1 &
+
+          DAEMON_PID=$!
+
+          echo "⏳ Waiting for tailscaled..."
           for i in $(seq 1 30); do
-            if tailscale status >/dev/null 2>&1; then
-              echo "✅ tailscaled is ready"
+            if sudo tailscale --socket="$TS_SOCKET" status >/dev/null 2>&1; then
+              echo "✅ tailscaled ready (${i}s)"
               break
             fi
+            if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+              echo "❌ tailscaled crashed. Log:"
+              cat /tmp/tailscaled.log
+              exit 1
+            fi
             if [ "$i" -eq 30 ]; then
-              echo "❌ tailscaled failed to start within 30s"
+              echo "❌ tailscaled not ready after 30s. Log:"
+              cat /tmp/tailscaled.log
               exit 1
             fi
             sleep 1
           done
 
           echo "🔑 Authenticating with Tailscale..."
-          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=gh-macos-dev --accept-routes
+          sudo tailscale --socket="$TS_SOCKET" up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname=gh-macos-dev \
+            --accept-routes
 
-          echo "🌐 Tailscale status:"
-          tailscale status
           echo ""
-          echo "📍 Tailscale IPv4: $(tailscale ip -4)"
+          echo "🌐 Tailscale status:"
+          sudo tailscale --socket="$TS_SOCKET" status
+          echo ""
+          TSIP=$(sudo tailscale --socket="$TS_SOCKET" ip -4)
+          echo "📍 Tailscale IPv4: $TSIP"
 
       # ── 5. Install code-server ───────────────────────────
       - name: 🖥️ Install code-server
         run: |
-          echo "Installing code-server via official install script..."
+          echo "Installing code-server..."
           curl -fsSL https://code-server.dev/install.sh | sh
           code-server --version
 
@@ -116,7 +134,6 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Resolve the global npm bin directory
           NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
 
           PROFILE=~/.zshrc
@@ -132,7 +149,6 @@ jobs:
             echo "alias ws='cd ${WORKSPACE} && ls -la'"
           } >> "$PROFILE"
 
-          # Also write a bashrc for bash users
           cp "$PROFILE" ~/.bashrc
 
           echo "✅ Shell environment configured"
@@ -144,7 +160,6 @@ jobs:
         run: |
           mkdir -p ~/.config/code-server
 
-          # code-server reads PASSWORD from env for auth
           PASSWORD="$PASSWORD" nohup code-server \
             --bind-addr "0.0.0.0:${PORT}" \
             --auth password \
@@ -175,8 +190,8 @@ jobs:
       # ── 10. Print connection info ─────────────────────────
       - name: 📋 Display connection details
         run: |
-          TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-          TAILSCALE_DNS=$(tailscale status --self --json 2>/dev/null \
+          TAILSCALE_IP=$(sudo tailscale --socket="$TS_SOCKET" ip -4 2>/dev/null || echo "unknown")
+          TAILSCALE_DNS=$(sudo tailscale --socket="$TS_SOCKET" status --self --json 2>/dev/null \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" \
             2>/dev/null || echo "unknown")
 
@@ -212,11 +227,13 @@ jobs:
       - name: ⏳ Keep session alive
         env:
           PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           echo "Session active — polling every 30s for ~/stop sentinel file..."
           echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
 
           SECONDS_ALIVE=0
+
           while true; do
             if [ -f ~/stop ]; then
               echo "🛑 Stop file detected (~/stop). Shutting down gracefully."
@@ -238,8 +255,18 @@ jobs:
             # Health-check tailscaled
             if ! pgrep -f tailscaled > /dev/null 2>&1; then
               echo "⚠️  tailscaled died — restarting..."
-              sudo tailscaled --state=/tmp/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --tun=utun &
-              sleep 3
+              sudo mkdir -p /var/run/tailscale
+              sudo tailscaled \
+                --state=/tmp/tailscaled.state \
+                --socket="$TS_SOCKET" \
+                --tun=userspace-networking \
+                --port=41641 \
+                > /tmp/tailscaled.log 2>&1 &
+              sleep 5
+              sudo tailscale --socket="$TS_SOCKET" up \
+                --authkey="$TS_AUTHKEY" \
+                --hostname=gh-macos-dev \
+                --accept-routes 2>/dev/null || true
             fi
 
             sleep 30
