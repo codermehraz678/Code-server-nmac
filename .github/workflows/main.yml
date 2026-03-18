@@ -50,7 +50,7 @@ jobs:
           # Symlink Downloads into the workspace so code-server can browse it
           ln -sfn ~/Downloads "$WORKSPACE/Downloads"
 
-          # Copy the checked-out repo into workspace (including dotfiles, safely)
+          # Copy the checked-out repo into workspace
           rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/" 2>/dev/null || true
 
           echo "✅ Workspace ready at $WORKSPACE"
@@ -62,16 +62,40 @@ jobs:
         with:
           node-version: "20"
 
-      # ── 4. Tailscale ─────────────────────────────────────
-      - name: 🔗 Connect to Tailscale
-        uses: tailscale/github-action@v2
-        with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-          # ── OR use OAuth (comment authkey above, uncomment below) ──
-          # oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          # oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
-          # tags:            tag:ci
-          hostname: gh-macos-dev
+      # ── 4. Tailscale (manual install for macOS) ──────────
+      - name: 🔗 Install and connect Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          set -euo pipefail
+
+          echo "📦 Installing Tailscale via Homebrew..."
+          brew install tailscale
+
+          echo "🚀 Starting tailscaled daemon..."
+          sudo tailscaled --state=/tmp/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --tun=utun &
+          
+          # Wait for the daemon socket to appear
+          echo "⏳ Waiting for tailscaled to be ready..."
+          for i in $(seq 1 30); do
+            if tailscale status >/dev/null 2>&1; then
+              echo "✅ tailscaled is ready"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "❌ tailscaled failed to start within 30s"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "🔑 Authenticating with Tailscale..."
+          sudo tailscale up --authkey="$TS_AUTHKEY" --hostname=gh-macos-dev --accept-routes
+
+          echo "🌐 Tailscale status:"
+          tailscale status
+          echo ""
+          echo "📍 Tailscale IPv4: $(tailscale ip -4)"
 
       # ── 5. Install code-server ───────────────────────────
       - name: 🖥️ Install code-server
@@ -92,10 +116,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Resolve the global npm bin directory (npm bin -g was removed in npm 9+)
+          # Resolve the global npm bin directory
           NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
 
-          # Make API key and PATH available inside code-server terminals
           PROFILE=~/.zshrc
           touch "$PROFILE"
 
@@ -121,17 +144,7 @@ jobs:
         run: |
           mkdir -p ~/.config/code-server
 
-          cat > ~/.config/code-server/config.yaml << 'OUTER'
-          bind-addr: 0.0.0.0:${PORT}
-          auth: password
-          cert: false
-          disable-telemetry: true
-          OUTER
-
-          # Inject the actual password (avoids YAML-escaping issues)
-          sed -i '' "s|^bind-addr:.*|bind-addr: 0.0.0.0:${PORT}|" ~/.config/code-server/config.yaml
-
-          # Start code-server in the background opening the workspace
+          # code-server reads PASSWORD from env for auth
           PASSWORD="$PASSWORD" nohup code-server \
             --bind-addr "0.0.0.0:${PORT}" \
             --auth password \
@@ -142,7 +155,6 @@ jobs:
           CODE_PID=$!
           sleep 4
 
-          # Verify it started
           if kill -0 "$CODE_PID" 2>/dev/null; then
             echo "✅ code-server running (PID $CODE_PID)"
           else
@@ -193,19 +205,19 @@ jobs:
           echo ""
           echo "$DIVIDER"
 
-          # Also surface as GitHub Actions annotations
           echo "::notice title=🖥️ code-server URL::http://${TAILSCALE_IP}:${PORT}"
           echo "::notice title=🔗 Tailscale DNS::http://${TAILSCALE_DNS}:${PORT}"
 
       # ── 11. Keep alive loop ──────────────────────────────
       - name: ⏳ Keep session alive
+        env:
+          PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
         run: |
           echo "Session active — polling every 30s for ~/stop sentinel file..."
           echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
 
           SECONDS_ALIVE=0
           while true; do
-            # Check for manual stop signal
             if [ -f ~/stop ]; then
               echo "🛑 Stop file detected (~/stop). Shutting down gracefully."
               break
@@ -214,7 +226,7 @@ jobs:
             # Health-check code-server
             if ! pgrep -f code-server > /dev/null 2>&1; then
               echo "⚠️  code-server process died — restarting..."
-              PASSWORD="${PASSWORD}" nohup code-server \
+              PASSWORD="$PASSWORD" nohup code-server \
                 --bind-addr "0.0.0.0:${PORT}" \
                 --auth password \
                 --disable-telemetry \
@@ -223,10 +235,16 @@ jobs:
               sleep 3
             fi
 
+            # Health-check tailscaled
+            if ! pgrep -f tailscaled > /dev/null 2>&1; then
+              echo "⚠️  tailscaled died — restarting..."
+              sudo tailscaled --state=/tmp/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock --tun=utun &
+              sleep 3
+            fi
+
             sleep 30
             SECONDS_ALIVE=$((SECONDS_ALIVE + 30))
 
-            # Print heartbeat every 5 minutes
             if [ $((SECONDS_ALIVE % 300)) -eq 0 ]; then
               MINS=$((SECONDS_ALIVE / 60))
               echo "💓 Heartbeat — alive for ${MINS} minutes"
