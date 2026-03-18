@@ -1,4 +1,4 @@
-name: "☁️ macOS Remote Dev Environment"
+name: "☁️ Ubuntu Remote Dev Environment"
 
 on:
   workflow_dispatch:
@@ -29,13 +29,12 @@ on:
 jobs:
   remote-dev:
     name: "🖥️ Spawn Dev Machine"
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(github.event.inputs.session-timeout || '360') }}
 
     env:
-      WORKSPACE: /Users/runner/workspace
+      WORKSPACE: /home/runner/workspace
       PORT: ${{ github.event.inputs.code-server-port || '8080' }}
-      TS_SOCKET: /var/run/tailscale/tailscaled.sock
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────
@@ -48,8 +47,10 @@ jobs:
           mkdir -p "$WORKSPACE"
           mkdir -p ~/Downloads
 
+          # Symlink Downloads into the workspace so code-server can browse it
           ln -sfn ~/Downloads "$WORKSPACE/Downloads"
 
+          # Copy the checked-out repo into workspace safely
           rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/" 2>/dev/null || true
 
           echo "✅ Workspace ready at $WORKSPACE"
@@ -61,59 +62,12 @@ jobs:
         with:
           node-version: "20"
 
-      # ── 4. Tailscale (manual install for macOS) ──────────
-      - name: 🔗 Install and connect Tailscale
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-        run: |
-          set -euo pipefail
-
-          echo "📦 Installing Tailscale..."
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install tailscale
-
-          sudo mkdir -p /var/run/tailscale
-
-          echo "🚀 Starting tailscaled (userspace networking)..."
-          sudo tailscaled \
-            --state=/tmp/tailscaled.state \
-            --socket="$TS_SOCKET" \
-            --tun=userspace-networking \
-            --port=41641 \
-            > /tmp/tailscaled.log 2>&1 &
-
-          DAEMON_PID=$!
-
-          echo "⏳ Waiting for tailscaled..."
-          for i in $(seq 1 30); do
-            if sudo tailscale --socket="$TS_SOCKET" status >/dev/null 2>&1; then
-              echo "✅ tailscaled ready (${i}s)"
-              break
-            fi
-            if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-              echo "❌ tailscaled crashed. Log:"
-              cat /tmp/tailscaled.log
-              exit 1
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "❌ tailscaled not ready after 30s. Log:"
-              cat /tmp/tailscaled.log
-              exit 1
-            fi
-            sleep 1
-          done
-
-          echo "🔑 Authenticating with Tailscale..."
-          sudo tailscale --socket="$TS_SOCKET" up \
-            --authkey="$TS_AUTHKEY" \
-            --hostname=gh-macos-dev \
-            --accept-routes
-
-          echo ""
-          echo "🌐 Tailscale status:"
-          sudo tailscale --socket="$TS_SOCKET" status
-          echo ""
-          TSIP=$(sudo tailscale --socket="$TS_SOCKET" ip -4)
-          echo "📍 Tailscale IPv4: $TSIP"
+      # ── 4. Tailscale (Official Action for Linux) ─────────
+      - name: 🔗 Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: gh-ubuntu-dev
 
       # ── 5. Install code-server ───────────────────────────
       - name: 🖥️ Install code-server
@@ -134,9 +88,10 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # Resolve the global npm bin directory safely
           NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
 
-          PROFILE=~/.zshrc
+          PROFILE=~/.bashrc
           touch "$PROFILE"
 
           {
@@ -149,7 +104,8 @@ jobs:
             echo "alias ws='cd ${WORKSPACE} && ls -la'"
           } >> "$PROFILE"
 
-          cp "$PROFILE" ~/.bashrc
+          # Also write a zshrc fallback for users who prefer zsh
+          cp "$PROFILE" ~/.zshrc
 
           echo "✅ Shell environment configured"
 
@@ -160,6 +116,7 @@ jobs:
         run: |
           mkdir -p ~/.config/code-server
 
+          # code-server reads $PASSWORD natively for authentication
           PASSWORD="$PASSWORD" nohup code-server \
             --bind-addr "0.0.0.0:${PORT}" \
             --auth password \
@@ -190,8 +147,8 @@ jobs:
       # ── 10. Print connection info ─────────────────────────
       - name: 📋 Display connection details
         run: |
-          TAILSCALE_IP=$(sudo tailscale --socket="$TS_SOCKET" ip -4 2>/dev/null || echo "unknown")
-          TAILSCALE_DNS=$(sudo tailscale --socket="$TS_SOCKET" status --self --json 2>/dev/null \
+          TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "unknown")
+          TAILSCALE_DNS=$(sudo tailscale status --self --json 2>/dev/null \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" \
             2>/dev/null || echo "unknown")
 
@@ -227,7 +184,6 @@ jobs:
       - name: ⏳ Keep session alive
         env:
           PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           echo "Session active — polling every 30s for ~/stop sentinel file..."
           echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
@@ -250,23 +206,6 @@ jobs:
                 "$WORKSPACE" \
                 > /tmp/code-server.log 2>&1 &
               sleep 3
-            fi
-
-            # Health-check tailscaled
-            if ! pgrep -f tailscaled > /dev/null 2>&1; then
-              echo "⚠️  tailscaled died — restarting..."
-              sudo mkdir -p /var/run/tailscale
-              sudo tailscaled \
-                --state=/tmp/tailscaled.state \
-                --socket="$TS_SOCKET" \
-                --tun=userspace-networking \
-                --port=41641 \
-                > /tmp/tailscaled.log 2>&1 &
-              sleep 5
-              sudo tailscale --socket="$TS_SOCKET" up \
-                --authkey="$TS_AUTHKEY" \
-                --hostname=gh-macos-dev \
-                --accept-routes 2>/dev/null || true
             fi
 
             sleep 30
