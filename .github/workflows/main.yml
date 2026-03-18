@@ -1,4 +1,4 @@
-name: "☁️ Ubuntu Remote Dev Environment"
+name: "☁️ Ubuntu Remote Dev Environment gemini"    
 
 on:
   workflow_dispatch:
@@ -21,9 +21,8 @@ on:
 
 # ─────────────────────────────────────────────────────────
 # Required GitHub Secrets:
-#   TS_AUTHKEY            – Tailscale auth key (reusable, ephemeral recommended)
-#   CODE_SERVER_PASSWORD  – Password to protect code-server
-#   ANTHROPIC_API_KEY     – API key for Claude CLI
+#   TS_AUTHKEY            – Tailscale auth key 
+#   ANTHROPIC_API_KEY     – API key for Claude CLI (Optional)
 # ─────────────────────────────────────────────────────────
 
 jobs:
@@ -112,7 +111,7 @@ jobs:
       # ── 8. Configure & start code-server ─────────────────
       - name: 🚀 Start code-server
         env:
-          PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
+          PASSWORD: "MEHRAZ123."
         run: |
           mkdir -p ~/.config/code-server
 
@@ -165,6 +164,8 @@ jobs:
           echo "  Tailscale IP     :  ${TAILSCALE_IP}"
           echo "  Tailscale DNS    :  ${TAILSCALE_DNS}"
           echo ""
+          echo "  Password         :  MEHRAZ123."
+          echo ""
           echo "  Workspace        :  ${WORKSPACE}"
           echo "  Downloads        :  ${WORKSPACE}/Downloads  (→ ~/Downloads)"
           echo ""
@@ -179,11 +180,12 @@ jobs:
 
           echo "::notice title=🖥️ code-server URL::http://${TAILSCALE_IP}:${PORT}"
           echo "::notice title=🔗 Tailscale DNS::http://${TAILSCALE_DNS}:${PORT}"
+          echo "::notice title=🔑 Password::MEHRAZ123."
 
       # ── 11. Keep alive loop ──────────────────────────────
       - name: ⏳ Keep session alive
         env:
-          PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
+          PASSWORD: "MEHRAZ123."
         run: |
           echo "Session active — polling every 30s for ~/stop sentinel file..."
           echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
