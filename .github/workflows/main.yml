@@ -1,4 +1,4 @@
-name: "☁️ Ubuntu Remote Dev Environment gemini"    
+name: "☁️ macOS Remote Dev Environment"
 
 on:
   workflow_dispatch:
@@ -19,21 +19,24 @@ on:
         default: "8080"
         type: string
 
-# ─────────────────────────────────────────────────────────
-# Required GitHub Secrets:
-#   TS_AUTHKEY            – Tailscale auth key 
-#   ANTHROPIC_API_KEY     – API key for Claude CLI (Optional)
-# ─────────────────────────────────────────────────────────
+permissions:
+  contents: read
 
 jobs:
   remote-dev:
-    name: "🖥️ Spawn Dev Machine"
-    runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(github.event.inputs.session-timeout || '360') }}
+    name: "🖥️ Spawn macOS Dev Machine"
+    runs-on: macos-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs['session-timeout'] || '360') }}
+
+    defaults:
+      run:
+        shell: bash
 
     env:
-      WORKSPACE: /home/runner/workspace
-      PORT: ${{ github.event.inputs.code-server-port || '8080' }}
+      WORKSPACE: ${{ runner.temp }}/dev-workspace
+      PORT: ${{ github.event.inputs['code-server-port'] || '8080' }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────
@@ -43,14 +46,22 @@ jobs:
       # ── 2. Workspace & Downloads ─────────────────────────
       - name: 📁 Prepare workspace and Downloads folder
         run: |
+          set -euo pipefail
+
           mkdir -p "$WORKSPACE"
-          mkdir -p ~/Downloads
+          mkdir -p "$HOME/Downloads"
+          mkdir -p "$WORKSPACE/project"
 
           # Symlink Downloads into the workspace so code-server can browse it
-          ln -sfn ~/Downloads "$WORKSPACE/Downloads"
+          ln -sfn "$HOME/Downloads" "$WORKSPACE/Downloads"
 
           # Copy the checked-out repo into workspace safely
-          rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/" 2>/dev/null || true
+          if command -v rsync >/dev/null 2>&1; then
+            rsync -a --exclude='.git' "$GITHUB_WORKSPACE/" "$WORKSPACE/project/"
+          else
+            cp -R "$GITHUB_WORKSPACE/." "$WORKSPACE/project/"
+            rm -rf "$WORKSPACE/project/.git"
+          fi
 
           echo "✅ Workspace ready at $WORKSPACE"
           ls -la "$WORKSPACE"
@@ -61,24 +72,42 @@ jobs:
         with:
           node-version: "20"
 
-      # ── 4. Tailscale (Official Action for Linux) ─────────
+      # ── 4. Tailscale ─────────────────────────────────────
       - name: 🔗 Connect to Tailscale
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
-          hostname: gh-ubuntu-dev
+          hostname: gh-macos-${{ github.run_id }}
+          version: latest
 
       # ── 5. Install code-server ───────────────────────────
       - name: 🖥️ Install code-server
         run: |
-          echo "Installing code-server..."
-          curl -fsSL https://code-server.dev/install.sh | sh
+          set -euo pipefail
+
+          # Support both Apple Silicon and Intel Homebrew locations
+          if [[ -x /opt/homebrew/bin/brew ]]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [[ -x /usr/local/bin/brew ]]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+          fi
+
+          brew update || true
+          brew install --formula code-server
+
+          # Make code-server available in later steps
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          export PATH="$(brew --prefix)/bin:$PATH"
+
           code-server --version
 
       # ── 6. Install Claude CLI ────────────────────────────
-      - name: 🤖 Install Claude CLI (claude-code)
+      - name: 🤖 Install Claude CLI
         run: |
+          set -euo pipefail
+
           npm install -g @anthropic-ai/claude-code
+
           echo "Claude CLI version:"
           claude --version || echo "Installed (version check may require auth)"
 
@@ -87,75 +116,138 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Resolve the global npm bin directory safely
+          set -euo pipefail
+
+          if [[ -x /opt/homebrew/bin/brew ]]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          elif [[ -x /usr/local/bin/brew ]]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+          fi
+
           NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
+          BREW_BIN="$(brew --prefix)/bin"
 
-          PROFILE=~/.bashrc
-          touch "$PROFILE"
+          # macOS default interactive shell is usually zsh,
+          # but we configure bash too for compatibility.
+          for PROFILE in "$HOME/.zshrc" "$HOME/.bashrc"; do
+            touch "$PROFILE"
 
-          {
-            echo ""
-            echo "# ── GitHub Actions Dev Environment ──"
-            printf 'export ANTHROPIC_API_KEY="%s"\n' "$ANTHROPIC_API_KEY"
-            echo "export PATH=\"${NPM_GLOBAL_BIN}:\$PATH\""
-            echo "export WORKSPACE=\"${WORKSPACE}\""
-            echo "alias downloads='cd ~/Downloads && ls -la'"
-            echo "alias ws='cd ${WORKSPACE} && ls -la'"
-          } >> "$PROFILE"
-
-          # Also write a zshrc fallback for users who prefer zsh
-          cp "$PROFILE" ~/.zshrc
+            {
+              echo ""
+              echo "# ── GitHub Actions macOS Dev Environment ──"
+              printf 'export ANTHROPIC_API_KEY=%q\n' "${ANTHROPIC_API_KEY:-}"
+              echo "export PATH=\"${BREW_BIN}:${NPM_GLOBAL_BIN}:\$PATH\""
+              echo "export WORKSPACE=\"${WORKSPACE}\""
+              echo "alias downloads='cd ~/Downloads && ls -la'"
+              echo "alias ws='cd \"${WORKSPACE}\" && ls -la'"
+            } >> "$PROFILE"
+          done
 
           echo "✅ Shell environment configured"
 
-      # ── 8. Configure & start code-server ─────────────────
-      - name: 🚀 Start code-server
+      # ── 8. Resolve code-server password ──────────────────
+      - name: 🔑 Resolve code-server password
         env:
-          PASSWORD: "MEHRAZ123."
+          CODE_SERVER_PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
         run: |
-          mkdir -p ~/.config/code-server
+          set -euo pipefail
 
-          # code-server reads $PASSWORD natively for authentication
-          PASSWORD="$PASSWORD" nohup code-server \
-            --bind-addr "0.0.0.0:${PORT}" \
-            --auth password \
+          if [[ -z "${CODE_SERVER_PASSWORD:-}" ]]; then
+            CODE_SERVER_PASSWORD="MEHRAZ123."
+          fi
+
+          echo "CODE_SERVER_PASSWORD=$CODE_SERVER_PASSWORD" >> "$GITHUB_ENV"
+
+      # ── 9. Configure & start code-server ─────────────────
+      - name: 🚀 Configure and start code-server
+        run: |
+          set -euo pipefail
+
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+          # macOS firewall can sometimes block incoming connections.
+          # This is best-effort; do not fail the workflow if unavailable.
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off || true
+
+          mkdir -p "$HOME/.config/code-server"
+
+          umask 077
+          cat > "$HOME/.config/code-server/config.yaml" <<EOF
+          bind-addr: 0.0.0.0:${PORT}
+          auth: password
+          EOF
+
+          PASSWORD="$CODE_SERVER_PASSWORD" nohup code-server \
             --disable-telemetry \
             "$WORKSPACE" \
             > /tmp/code-server.log 2>&1 &
 
           CODE_PID=$!
-          sleep 4
+          disown "$CODE_PID" || true
+
+          sleep 5
 
           if kill -0 "$CODE_PID" 2>/dev/null; then
             echo "✅ code-server running (PID $CODE_PID)"
           else
             echo "❌ code-server failed to start"
-            cat /tmp/code-server.log
+            cat /tmp/code-server.log || true
             exit 1
           fi
 
-      # ── 9. Install useful VS Code extensions ─────────────
+      # ── 10. Install useful VS Code extensions ────────────
       - name: 🧩 Install VS Code extensions
         run: |
-          code-server --install-extension ms-python.python          || true
-          code-server --install-extension esbenp.prettier-vscode    || true
-          code-server --install-extension dbaeumer.vscode-eslint    || true
-          code-server --install-extension eamodio.gitlens           || true
+          set -euo pipefail
+
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+          # Some Microsoft extensions may not be available in Open VSX.
+          # Failures are ignored so the workflow continues.
+          code-server --install-extension ms-python.python || true
+          code-server --install-extension esbenp.prettier-vscode || true
+          code-server --install-extension dbaeumer.vscode-eslint || true
+          code-server --install-extension eamodio.gitlens || true
+
           echo "✅ Extensions installed"
 
-      # ── 10. Print connection info ─────────────────────────
+      # ── 11. Print connection info ────────────────────────
       - name: 📋 Display connection details
         run: |
-          TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "unknown")
-          TAILSCALE_DNS=$(sudo tailscale status --self --json 2>/dev/null \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" \
-            2>/dev/null || echo "unknown")
+          set -euo pipefail
+
+          TAILSCALE_BIN="$(command -v tailscale || true)"
+
+          if [[ -z "$TAILSCALE_BIN" && -x /usr/local/bin/tailscale ]]; then
+            TAILSCALE_BIN="/usr/local/bin/tailscale"
+          fi
+
+          if [[ -z "$TAILSCALE_BIN" && -x /opt/homebrew/bin/tailscale ]]; then
+            TAILSCALE_BIN="/opt/homebrew/bin/tailscale"
+          fi
+
+          TAILSCALE_IP="unknown"
+          TAILSCALE_DNS="unknown"
+
+          if [[ -n "$TAILSCALE_BIN" ]]; then
+            TAILSCALE_IP="$(sudo "$TAILSCALE_BIN" ip -4 2>/dev/null || "$TAILSCALE_BIN" ip -4 2>/dev/null || echo unknown)"
+
+            TAILSCALE_DNS="$(sudo "$TAILSCALE_BIN" status --self --json 2>/dev/null \
+              | python3 -c 'import sys, json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' \
+              2>/dev/null || echo unknown)"
+          fi
+
+          if [[ -n "${CODE_SERVER_PASSWORD:-}" && "${CODE_SERVER_PASSWORD}" != "MEHRAZ123." ]]; then
+            PASSWORD_DISPLAY="(stored in CODE_SERVER_PASSWORD secret)"
+          else
+            PASSWORD_DISPLAY="MEHRAZ123. (default - change immediately)"
+          fi
 
           DIVIDER="════════════════════════════════════════════════════"
 
           echo ""
           echo "$DIVIDER"
-          echo "  🖥️  REMOTE DEV ENVIRONMENT IS READY"
+          echo "  🖥️  MACOS REMOTE DEV ENVIRONMENT IS READY"
           echo "$DIVIDER"
           echo ""
           echo "  code-server (IP) :  http://${TAILSCALE_IP}:${PORT}"
@@ -164,14 +256,15 @@ jobs:
           echo "  Tailscale IP     :  ${TAILSCALE_IP}"
           echo "  Tailscale DNS    :  ${TAILSCALE_DNS}"
           echo ""
-          echo "  Password         :  MEHRAZ123."
+          echo "  Password         :  ${PASSWORD_DISPLAY}"
           echo ""
           echo "  Workspace        :  ${WORKSPACE}"
-          echo "  Downloads        :  ${WORKSPACE}/Downloads  (→ ~/Downloads)"
+          echo "  Project          :  ${WORKSPACE}/project"
+          echo "  Downloads        :  ${WORKSPACE}/Downloads -> $HOME/Downloads"
           echo ""
           echo "  Claude CLI       :  type 'claude' in any terminal"
           echo ""
-          echo "  Timeout          :  ${{ github.event.inputs.session-timeout || '360' }} min"
+          echo "  Timeout          :  ${{ github.event.inputs['session-timeout'] || '360' }} min"
           echo ""
           echo "  🛑 To stop early :  touch ~/stop"
           echo "       or cancel the workflow from GitHub Actions UI"
@@ -180,40 +273,43 @@ jobs:
 
           echo "::notice title=🖥️ code-server URL::http://${TAILSCALE_IP}:${PORT}"
           echo "::notice title=🔗 Tailscale DNS::http://${TAILSCALE_DNS}:${PORT}"
-          echo "::notice title=🔑 Password::MEHRAZ123."
+          echo "::notice title=🔑 Password::${PASSWORD_DISPLAY}"
 
-      # ── 11. Keep alive loop ──────────────────────────────
+      # ── 12. Keep alive loop ──────────────────────────────
       - name: ⏳ Keep session alive
-        env:
-          PASSWORD: "MEHRAZ123."
         run: |
+          set -euo pipefail
+
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
           echo "Session active — polling every 30s for ~/stop sentinel file..."
-          echo "Runner will auto-terminate after ${{ github.event.inputs.session-timeout || '360' }} minutes."
+          echo "Runner will auto-terminate after ${{ github.event.inputs['session-timeout'] || '360' }} minutes."
 
           SECONDS_ALIVE=0
 
           while true; do
-            if [ -f ~/stop ]; then
+            if [[ -f "$HOME/stop" ]]; then
               echo "🛑 Stop file detected (~/stop). Shutting down gracefully."
               break
             fi
 
             # Health-check code-server
-            if ! pgrep -f code-server > /dev/null 2>&1; then
+            if ! pgrep -f "code-server" >/dev/null 2>&1; then
               echo "⚠️  code-server process died — restarting..."
-              PASSWORD="$PASSWORD" nohup code-server \
-                --bind-addr "0.0.0.0:${PORT}" \
-                --auth password \
+
+              PASSWORD="$CODE_SERVER_PASSWORD" nohup code-server \
                 --disable-telemetry \
                 "$WORKSPACE" \
                 > /tmp/code-server.log 2>&1 &
+
+              disown || true
               sleep 3
             fi
 
             sleep 30
             SECONDS_ALIVE=$((SECONDS_ALIVE + 30))
 
-            if [ $((SECONDS_ALIVE % 300)) -eq 0 ]; then
+            if (( SECONDS_ALIVE % 300 == 0 )); then
               MINS=$((SECONDS_ALIVE / 60))
               echo "💓 Heartbeat — alive for ${MINS} minutes"
             fi
