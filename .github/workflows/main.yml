@@ -13,6 +13,7 @@ on:
           - "120"
           - "240"
           - "360"
+
       code-server-port:
         description: "code-server port"
         required: false
@@ -26,6 +27,7 @@ jobs:
   remote-dev:
     name: "🖥️ Spawn macOS Dev Machine"
     runs-on: macos-latest
+
     timeout-minutes: ${{ fromJSON(github.event.inputs['session-timeout'] || '360') }}
 
     defaults:
@@ -33,7 +35,6 @@ jobs:
         shell: bash
 
     env:
-      WORKSPACE: ${{ runner.temp }}/dev-workspace
       PORT: ${{ github.event.inputs['code-server-port'] || '8080' }}
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -43,7 +44,19 @@ jobs:
       - name: 📦 Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Workspace & Downloads ─────────────────────────
+      # ── 2. Set workspace path safely ─────────────────────
+      - name: 🧭 Set workspace path
+        run: |
+          set -euo pipefail
+
+          WORKSPACE_ROOT="${RUNNER_TEMP:-/tmp}"
+          WORKSPACE_PATH="${WORKSPACE_ROOT}/dev-workspace"
+
+          echo "WORKSPACE=${WORKSPACE_PATH}" >> "$GITHUB_ENV"
+
+          echo "Workspace will be: ${WORKSPACE_PATH}"
+
+      # ── 3. Workspace & Downloads ─────────────────────────
       - name: 📁 Prepare workspace and Downloads folder
         run: |
           set -euo pipefail
@@ -66,21 +79,20 @@ jobs:
           echo "✅ Workspace ready at $WORKSPACE"
           ls -la "$WORKSPACE"
 
-      # ── 3. Node.js ───────────────────────────────────────
+      # ── 4. Node.js ───────────────────────────────────────
       - name: ⬢ Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # ── 4. Tailscale ─────────────────────────────────────
+      # ── 5. Tailscale ─────────────────────────────────────
       - name: 🔗 Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           hostname: gh-macos-${{ github.run_id }}
-          version: latest
 
-      # ── 5. Install code-server ───────────────────────────
+      # ── 6. Install code-server ───────────────────────────
       - name: 🖥️ Install code-server
         run: |
           set -euo pipefail
@@ -93,7 +105,7 @@ jobs:
           fi
 
           brew update || true
-          brew install --formula code-server
+          brew install code-server
 
           # Make code-server available in later steps
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
@@ -101,7 +113,7 @@ jobs:
 
           code-server --version
 
-      # ── 6. Install Claude CLI ────────────────────────────
+      # ── 7. Install Claude CLI ────────────────────────────
       - name: 🤖 Install Claude CLI
         run: |
           set -euo pipefail
@@ -109,9 +121,9 @@ jobs:
           npm install -g @anthropic-ai/claude-code
 
           echo "Claude CLI version:"
-          claude --version || echo "Installed (version check may require auth)"
+          claude --version || echo "Installed, but version check may require auth"
 
-      # ── 7. Persist env vars for interactive shells ───────
+      # ── 8. Persist env vars for interactive shells ───────
       - name: 🔐 Configure environment for interactive sessions
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -125,7 +137,12 @@ jobs:
           fi
 
           NPM_GLOBAL_BIN="$(npm prefix -g)/bin"
-          BREW_BIN="$(brew --prefix)/bin"
+
+          if command -v brew >/dev/null 2>&1; then
+            BREW_BIN="$(brew --prefix)/bin"
+          else
+            BREW_BIN="/opt/homebrew/bin"
+          fi
 
           # macOS default interactive shell is usually zsh,
           # but we configure bash too for compatibility.
@@ -145,7 +162,7 @@ jobs:
 
           echo "✅ Shell environment configured"
 
-      # ── 8. Resolve code-server password ──────────────────
+      # ── 9. Resolve code-server password ──────────────────
       - name: 🔑 Resolve code-server password
         env:
           CODE_SERVER_PASSWORD: ${{ secrets.CODE_SERVER_PASSWORD }}
@@ -158,7 +175,7 @@ jobs:
 
           echo "CODE_SERVER_PASSWORD=$CODE_SERVER_PASSWORD" >> "$GITHUB_ENV"
 
-      # ── 9. Configure & start code-server ─────────────────
+      # ── 10. Configure & start code-server ────────────────
       - name: 🚀 Configure and start code-server
         run: |
           set -euo pipefail
@@ -178,6 +195,8 @@ jobs:
           EOF
 
           PASSWORD="$CODE_SERVER_PASSWORD" nohup code-server \
+            --bind-addr "0.0.0.0:${PORT}" \
+            --auth password \
             --disable-telemetry \
             "$WORKSPACE" \
             > /tmp/code-server.log 2>&1 &
@@ -195,7 +214,7 @@ jobs:
             exit 1
           fi
 
-      # ── 10. Install useful VS Code extensions ────────────
+      # ── 11. Install useful VS Code extensions ────────────
       - name: 🧩 Install VS Code extensions
         run: |
           set -euo pipefail
@@ -211,7 +230,7 @@ jobs:
 
           echo "✅ Extensions installed"
 
-      # ── 11. Print connection info ────────────────────────
+      # ── 12. Print connection info ────────────────────────
       - name: 📋 Display connection details
         run: |
           set -euo pipefail
@@ -275,7 +294,7 @@ jobs:
           echo "::notice title=🔗 Tailscale DNS::http://${TAILSCALE_DNS}:${PORT}"
           echo "::notice title=🔑 Password::${PASSWORD_DISPLAY}"
 
-      # ── 12. Keep alive loop ──────────────────────────────
+      # ── 13. Keep alive loop ──────────────────────────────
       - name: ⏳ Keep session alive
         run: |
           set -euo pipefail
@@ -298,6 +317,8 @@ jobs:
               echo "⚠️  code-server process died — restarting..."
 
               PASSWORD="$CODE_SERVER_PASSWORD" nohup code-server \
+                --bind-addr "0.0.0.0:${PORT}" \
+                --auth password \
                 --disable-telemetry \
                 "$WORKSPACE" \
                 > /tmp/code-server.log 2>&1 &
